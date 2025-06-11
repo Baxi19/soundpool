@@ -9,7 +9,9 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.plugin.common.*
+import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URI
@@ -18,31 +20,32 @@ import java.util.concurrent.*
 private val loadExecutor: Executor = Executors.newCachedThreadPool()
 private val uiHandler = Handler(Looper.getMainLooper())
 
-class SoundpoolPlugin : MethodCallHandler, FlutterPlugin {
+class SoundpoolPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     companion object {
         private const val CHANNEL_NAME = "pl.ukaszapps/soundpool"
-
-        @JvmStatic
-        fun registerWith(registrar: PluginRegistry.Registrar) {
-            SoundpoolPlugin().apply {
-                onRegister(registrar.context(), registrar.messenger())
-            }
-        }
     }
 
     private lateinit var context: Context
+    private lateinit var channel: MethodChannel
     private val wrappers = mutableListOf<SoundpoolWrapper>()
 
+    // Flutter Plugin V2: se dispara al adjuntar al engine
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        onRegister(binding.applicationContext, binding.binaryMessenger)
+        context = binding.applicationContext
+        channel = MethodChannel(binding.binaryMessenger, CHANNEL_NAME)
+        channel.setMethodCallHandler(this)
+        // limpiar caché de sesiones anteriores
+        context.cacheDir
+            .listFiles { _, name -> name.matches(Regex("sound.*pool")) }
+            ?.forEach { it.delete() }
     }
 
-    private fun onRegister(appContext: Context, messenger: BinaryMessenger) {
-        context = appContext.applicationContext
-        MethodChannel(messenger, CHANNEL_NAME).setMethodCallHandler(this)
-        context.cacheDir?.listFiles { _, name -> name.matches(Regex("sound.*pool")) }
-            ?.forEach { it.delete() }
+    // Flutter Plugin V2: se dispara al desacoplar del engine
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        channel.setMethodCallHandler(null)
+        wrappers.forEach { it.dispose() }
+        wrappers.clear()
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -62,22 +65,17 @@ class SoundpoolPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             "dispose" -> {
-                val poolId = (call.argument<Int>("poolId"))!!
+                val poolId = call.argument<Int>("poolId")!!
                 wrappers[poolId].dispose()
                 wrappers.removeAt(poolId)
                 result.success(null)
             }
 
             else -> {
-                val poolId = (call.argument<Int>("poolId"))!!
+                val poolId = call.argument<Int>("poolId")!!
                 wrappers[poolId].onMethodCall(call, result)
             }
         }
-    }
-
-    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        wrappers.forEach { it.dispose() }
-        wrappers.clear()
     }
 
     private fun mapStreamType(index: Int): Int = when (index) {
@@ -89,6 +87,10 @@ class SoundpoolPlugin : MethodCallHandler, FlutterPlugin {
     }
 }
 
+// -------------------------------------
+// Helpers internos
+// -------------------------------------
+
 private data class VolumeInfo(val left: Float = 1.0f, val right: Float = 1.0f)
 
 private class SoundpoolWrapper(
@@ -96,7 +98,6 @@ private class SoundpoolWrapper(
     private val maxStreams: Int,
     private val streamType: Int
 ) {
-
     private var soundPool: SoundPool = createSoundPool()
     private val threadPool: ExecutorService =
         ThreadPoolExecutor(1, maxStreams, 1, TimeUnit.SECONDS, LinkedBlockingDeque())
@@ -126,7 +127,7 @@ private class SoundpoolWrapper(
         }.apply {
             setOnLoadCompleteListener { _, soundId, status ->
                 loadingSounds.remove(soundId)?.let { result ->
-                    runOnUi {
+                    uiHandler.post {
                         if (status == 0) result.success(soundId)
                         else result.error("Loading failed", "Error code: $status", null)
                     }
@@ -140,121 +141,107 @@ private class SoundpoolWrapper(
             "load" -> loadExecutor.execute {
                 try {
                     val args = call.arguments as Map<String, Any>
-                    val soundData = args["rawSound"] as ByteArray
+                    val data = args["rawSound"] as ByteArray
                     val priority = args["priority"] as Int
-                    val tempFile = createTempFile("sound", "pool", context.cacheDir)
-                    FileOutputStream(tempFile).use { it.write(soundData) }
-                    tempFile.deleteOnExit()
+                    val tmp = createTempFile("sound", "pool", context.cacheDir)
+                    FileOutputStream(tmp).use { it.write(data) }
+                    tmp.deleteOnExit()
 
-                    val soundId = soundPool.load(tempFile.absolutePath, priority)
+                    val soundId = soundPool.load(tmp.absolutePath, priority)
                     if (soundId > -1) loadingSounds[soundId] = result
-                    else runOnUi { result.success(soundId) }
+                    else uiHandler.post { result.success(soundId) }
                 } catch (e: Throwable) {
-                    runOnUi { result.error("Loading failure", e.message, null) }
+                    uiHandler.post { result.error("Load error", e.message, null) }
                 }
             }
 
             "loadUri" -> loadExecutor.execute {
                 try {
                     val args = call.arguments as Map<String, Any>
-                    val soundUri = args["uri"] as String
+                    val uriStr = args["uri"] as String
                     val priority = args["priority"] as Int
-
-                    val soundId = URI.create(soundUri).let { uri ->
+                    val soundId = URI.create(uriStr).let { uri ->
                         if (uri.scheme == "content") {
-                            soundPool.load(context.contentResolver.openAssetFileDescriptor(Uri.parse(soundUri), "r"), 1)
+                            soundPool.load(
+                                context.contentResolver.openAssetFileDescriptor(Uri.parse(uriStr), "r"),
+                                1
+                            )
                         } else {
-                            val tempFile = createTempFile("sound", "pool", context.cacheDir)
-                            FileOutputStream(tempFile).use { it.write(uri.toURL().readBytes()) }
-                            tempFile.deleteOnExit()
-                            soundPool.load(tempFile.absolutePath, priority)
+                            val tmp = createTempFile("sound", "pool", context.cacheDir)
+                            FileOutputStream(tmp).use { it.write(uri.toURL().readBytes()) }
+                            tmp.deleteOnExit()
+                            soundPool.load(tmp.absolutePath, priority)
                         }
                     }
-
                     if (soundId > -1) loadingSounds[soundId] = result
-                    else runOnUi { result.success(soundId) }
+                    else uiHandler.post { result.success(soundId) }
                 } catch (e: Throwable) {
-                    runOnUi { result.error("URI loading failure", e.message, null) }
+                    uiHandler.post { result.error("URI load error", e.message, null) }
                 }
             }
 
-            "play" -> {
-                val args = call.arguments as Map<String, Any>
-                val soundId = args["soundId"] as Int
-                val repeat = args["repeat"] as? Int ?: 0
-                val rate = args["rate"] as? Double ?: 1.0
-                val volume = volumeSettings[soundId] ?: VolumeInfo()
-
-                runInBg {
-                    val streamId = soundPool.play(soundId, volume.left, volume.right, 0, repeat, rate.toFloat())
-                    runOnUi { result.success(streamId) }
-                }
-            }
-
-            "pause", "resume", "stop" -> {
-                val streamId = (call.argument<Int>("streamId"))!!
-                runInBg {
-                    when (call.method) {
-                        "pause" -> soundPool.pause(streamId)
-                        "resume" -> soundPool.resume(streamId)
-                        "stop" -> soundPool.stop(streamId)
-                    }
-                    runOnUi { result.success(streamId) }
-                }
-            }
-
-            "setVolume" -> {
-                val args = call.arguments as Map<String, Any?>
-                val volumeLeft = (args["volumeLeft"] as Double).toFloat()
-                val volumeRight = (args["volumeRight"] as Double).toFloat()
-
-                runInBg {
-                    (args["streamId"] as? Int)?.let {
-                        soundPool.setVolume(it, volumeLeft, volumeRight)
-                    }
-                    (args["soundId"] as? Int)?.let {
-                        volumeSettings[it] = VolumeInfo(volumeLeft, volumeRight)
-                    }
-                    runOnUi { result.success(null) }
-                }
-            }
-
-            "setRate" -> {
-                val args = call.arguments as Map<String, Any?>
-                val streamId = args["streamId"] as Int
-                val rate = (args["rate"] as? Double ?: 1.0).toFloat()
-
-                runInBg {
-                    soundPool.setRate(streamId, rate)
-                    runOnUi { result.success(null) }
-                }
-            }
-
-            "release" -> {
-                release()
-                soundPool = createSoundPool()
-                result.success(null)
+            "play", "pause", "resume", "stop", "setVolume", "setRate", "release" -> {
+                // redirige internamente a cada función
+                handleControl(call, result)
             }
 
             else -> result.notImplemented()
         }
     }
 
+    private fun handleControl(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "play" -> {
+                val args = call.arguments as Map<String, Any>
+                val soundId = args["soundId"] as Int
+                val repeat = args["repeat"] as? Int ?: 0
+                val rate = (args["rate"] as? Double ?: 1.0).toFloat()
+                val vol = volumeSettings[soundId] ?: VolumeInfo()
+
+                threadPool.execute {
+                    val streamId = soundPool.play(soundId, vol.left, vol.right, 0, repeat, rate)
+                    uiHandler.post { result.success(streamId) }
+                }
+            }
+            "pause", "resume", "stop" -> {
+                val streamId = call.argument<Int>("streamId")!!
+                threadPool.execute {
+                    when (call.method) {
+                        "pause" -> soundPool.pause(streamId)
+                        "resume" -> soundPool.resume(streamId)
+                        "stop" -> soundPool.stop(streamId)
+                    }
+                    uiHandler.post { result.success(streamId) }
+                }
+            }
+            "setVolume" -> {
+                val args = call.arguments as Map<String, Any?>
+                val left = (args["volumeLeft"] as Double).toFloat()
+                val right = (args["volumeRight"] as Double).toFloat()
+                threadPool.execute {
+                    (args["streamId"] as? Int)?.let { soundPool.setVolume(it, left, right) }
+                    (args["soundId"] as? Int)?.let { volumeSettings[it] = VolumeInfo(left, right) }
+                    uiHandler.post { result.success(null) }
+                }
+            }
+            "setRate" -> {
+                val streamId = call.argument<Int>("streamId")!!
+                val rate = (call.argument<Double>("rate") ?: 1.0).toFloat()
+                threadPool.execute {
+                    soundPool.setRate(streamId, rate)
+                    uiHandler.post { result.success(null) }
+                }
+            }
+            "release" -> {
+                soundPool.release()
+                soundPool = createSoundPool()
+                result.success(null)
+            }
+        }
+    }
+
     fun dispose() {
-        release()
+        soundPool.release()
         threadPool.shutdownNow()
     }
-
-    private fun release() {
-        soundPool.release()
-    }
-
-    private fun runOnUi(block: () -> Unit) {
-        uiHandler.post(block)
-    }
-
-    private fun runInBg(block: () -> Unit) {
-        threadPool.execute(block)
-    }
 }
-
